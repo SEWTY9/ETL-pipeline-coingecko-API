@@ -24,56 +24,6 @@
 
 ---
 
-## 🏗️ Архитектура
-
-```
-┌─────────────────┐
-│   CoinGecko     │
-│      API        │
-└────────┬────────┘
-         │
-    (EXTRACT)
-         │
-    ┌────▼─────┐
-    │ Airflow  │ ◄── Оркестрация
-    │   DAG    │
-    └────┬─────┘
-         │
-  ┌──────┼──────┐
-  │      │      │
-(LOAD) (LOAD) (LOAD)
-  │      │      │
-  ▼      ▼      ▼
-┌─────────────────────────────────┐
-│      PostgreSQL Database        │
-├─────────────────────────────────┤
-│ • raw_crypto_data     (Bronze)  │
-│ • crypto_prices       (Gold)    │
-│ • crypto_metrics      (Metrics) │
-│ • crypto_analytics    (Analytics)│
-└─────────────────────────────────┘
-```
-
-### Компоненты
-
-- **🌐 Airflow** - оркестрирует конвейер, запускает задачи каждые 12 часов
-- **🗄️ PostgreSQL** - хранит все данные (raw, processed, metrics, analytics)
-- **🐳 Docker** - контейнеризированная среда для простого развертывания
-- **📊 pgAdmin** - веб-интерфейс для управления БД
-
----
-
-## 📊 Схема Базы Данных
-
-| Таблица | Описание |
-|---------|---------|
-| `raw_crypto_data` | Сырые JSON-данные из API |
-| `crypto_prices` | Обработанные данные о цены |
-| `crypto_metrics` | Агрегированные метрики (avg, min, max) |
-| `crypto_analytics` | Рассчитанные показатели (returns, MA, volatility) |
-
----
-
 ## 🛠️ Установка и Запуск
 
 ### Требования
@@ -192,35 +142,6 @@ docker-compose restart postgres
 
 # Проверка статуса
 docker-compose ps
-```
-
----
-
-## 📈 Примеры SQL Запросов
-
-### Получить последнюю цену каждой криптовалюты
-
-```sql
-SELECT coin, price_usd, loaded_at 
-FROM crypto_prices 
-ORDER BY loaded_at DESC 
-LIMIT 15;
-```
-
-### Статистика по цены
-
-```sql
-SELECT * FROM crypto_metrics 
-ORDER BY avg_price DESC;
-```
-
-### Анализ волатильности
-
-```sql
-SELECT coin, volatility_7, volatility_30 
-FROM crypto_analytics 
-WHERE loaded_at >= NOW() - INTERVAL '7 days'
-ORDER BY volatility_30 DESC;
 ```
 
 ---
