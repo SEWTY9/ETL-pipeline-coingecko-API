@@ -134,4 +134,4 @@ plugins/
 
 # Docker volumes
 postgres_data/
-airflow_postgres_data/
+airflow_postgres_data/".idea/" 
