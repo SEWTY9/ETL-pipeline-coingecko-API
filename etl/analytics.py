@@ -3,7 +3,6 @@ from sqlalchemy import create_engine, text
 import pandas as pd
 
 import logging
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -11,13 +10,13 @@ DB_URL = "postgresql://postgres:postgres@postgres:5432/crypto_db"
 
 
 def calculate_metrics() -> None:
-    """Расчет агрегированных метрик"""
+    """Расчёт агрегированных метрик по silver-слою"""
 
     engine = create_engine(DB_URL)
 
-    logger.info("Calculating SQL metrics...")
+    logger.info("Calculating SQL metrics from silver layer...")
 
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE crypto_metrics"))
 
         query = text("""
@@ -28,51 +27,54 @@ def calculate_metrics() -> None:
                 MIN(price_usd) AS min_price,
                 MAX(price_usd) AS max_price,
                 COUNT(*) AS records_count
-            FROM crypto_prices
+            FROM crypto_prices_silver
             GROUP BY coin
         """)
 
         conn.execute(query)
-    
-    logger.info("Metrics calculated and stored in crypto_metrics")
+
+    logger.info("Metrics recalculated in crypto_metrics")
 
 
 def pandas_analytics() -> None:
-    """Аналитика с pandas"""
+    """Аналитика с pandas: MA, daily return, volatility — из silver"""
 
     engine = create_engine(DB_URL)
 
-    logger.info("Running pandas analytics...")
+    logger.info("Running pandas analytics on silver layer...")
 
-    df = pd.read_sql("SELECT * FROM crypto_prices ORDER BY loaded_at", engine)
+    df = pd.read_sql(
+        "SELECT coin, price_usd, extracted_at FROM crypto_prices_silver ORDER BY extracted_at",
+        engine,
+    )
 
     if df.empty:
         logger.warning("No data to process in pandas analytics")
-        print("No data to process")
+        return
 
-    result_rows = []
+    df["price_usd"] = df["price_usd"].astype(float)
+    df = df.sort_values(["coin", "extracted_at"])
 
-    for coin, group in df.groupby("coin"):
-        group = group.sort_values("loaded_at").copy()
-        group["daily_return"] = group["price_usd"].pct_change()
-        group["ma_7"] = group["price_usd"].rolling(7, min_periods=1).mean()
-        group["ma_30"] = group["price_usd"].rolling(30, min_periods=1).mean()
-        group["volatility_7"] = group["price_usd"].rolling(7, min_periods=1).std().fillna(0)
-        group["volatility_30"] = group["price_usd"].rolling(30, min_periods=1).std().fillna(0)
+    grouped = df.groupby("coin", group_keys=False)
+    df["daily_return"] = grouped["price_usd"].pct_change()
+    df["ma_7"] = grouped["price_usd"].transform(lambda s: s.rolling(7, min_periods=1).mean())
+    df["ma_30"] = grouped["price_usd"].transform(lambda s: s.rolling(30, min_periods=1).mean())
+    df["volatility_7"] = grouped["price_usd"].transform(
+        lambda s: s.rolling(7, min_periods=1).std().fillna(0)
+    )
+    df["volatility_30"] = grouped["price_usd"].transform(
+        lambda s: s.rolling(30, min_periods=1).std().fillna(0)
+    )
 
-        for _, row in group.iterrows():
-            result_rows.append({
-                "coin": coin,
-                "price_usd": row["price_usd"],
-                "loaded_at": row["loaded_at"],
-                "daily_return": row["daily_return"],
-                "ma_7": row["ma_7"],
-                "ma_30": row["ma_30"],
-                "volatility_7": row["volatility_7"],
-                "volatility_30": row["volatility_30"],
-            })
+    result = df[[
+        "coin", "price_usd", "extracted_at",
+        "daily_return", "ma_7", "ma_30",
+        "volatility_7", "volatility_30",
+    ]]
 
-    result_df = pd.DataFrame(result_rows)
-    result_df.to_sql("crypto_analytics", engine, if_exists="append", index=False)
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE TABLE crypto_analytics"))
 
-    logger.info(f"Pandas analytics completed: {len(result_rows)} rows stored")
+    result.to_sql("crypto_analytics", engine, if_exists="append", index=False)
+
+    logger.info(f"Pandas analytics completed: {len(result)} rows stored")

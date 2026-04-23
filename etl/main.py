@@ -1,13 +1,14 @@
 import requests
 import json
 import time
+from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 import logging
 from typing import Dict, List, Any, Optional
 
 
-from analytics import calculate_metrics
-from analytics import pandas_analytics
+from analytics import calculate_metrics, pandas_analytics
+from gold import build_latest_prices, build_daily_summary, build_price_changes
 
 
 logging.basicConfig(level=logging.INFO)
@@ -30,8 +31,9 @@ def wait_for_db() -> bool:
         except Exception as e:
             logger.warning(f"Database not ready yet (attempt {attempt + 1}/10): {e}")
             time.sleep(5)
-    
+
     raise Exception("Database is not ready after multiple attempts.")
+
 
 def extract() -> Dict[str, Any]:
     """Извлечение данных из CoinGecko API"""
@@ -55,11 +57,12 @@ def extract() -> Dict[str, Any]:
         raise
 
 
-def transform(raw_data: Optional[Dict[str, Any]] = None, **context) -> List[Dict[str, str]]:
-    """Трансформация данных"""
+def transform(raw_data: Optional[Dict[str, Any]] = None, **context) -> List[Dict[str, Any]]:
+    """Трансформация данных: JSON → список плоских строк"""
 
-    ti = context['ti']
-    raw_data = ti.xcom_pull(task_ids='extract_data')
+    ti = context.get('ti')
+    if ti is not None:
+        raw_data = ti.xcom_pull(task_ids='extract_data')
 
     rows = []
 
@@ -68,7 +71,7 @@ def transform(raw_data: Optional[Dict[str, Any]] = None, **context) -> List[Dict
     for coin, values in raw_data.items():
         row = {
             "coin": coin,
-            "price": values["usd"]
+            "price": values.get("usd"),
         }
         rows.append(row)
 
@@ -77,16 +80,17 @@ def transform(raw_data: Optional[Dict[str, Any]] = None, **context) -> List[Dict
 
 
 def load_raw(raw_data: Optional[Dict[str, Any]] = None, **context) -> None:
-    """Загрузка в бронзовый слой (raw)"""
+    """Загрузка в bronze-слой (raw) — JSONB как есть"""
 
-    ti = context['ti']
-    raw_data = ti.xcom_pull(task_ids='extract_data')
+    ti = context.get('ti')
+    if ti is not None:
+        raw_data = ti.xcom_pull(task_ids='extract_data')
 
     engine = create_engine(DB_URL)
 
     logger.info("Loading raw data to database...")
 
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         query = text("""
             INSERT INTO raw_crypto_data (raw_json)
             VALUES (:data)
@@ -96,29 +100,68 @@ def load_raw(raw_data: Optional[Dict[str, Any]] = None, **context) -> None:
     logger.info("Raw data loaded successfully")
 
 
-def load_gold(rows: Optional[List[Dict[str, Any]]] = None, **context) -> None:
-    """Загрузка в голд слой (crypto_prices)"""
+def load_silver(
+    rows: Optional[List[Dict[str, Any]]] = None,
+    extracted_at: Optional[datetime] = None,
+    **context,
+) -> None:
+    """
+    Загрузка в silver-слой: валидация + дедуп + нормализация типов.
 
-    ti = context['ti']
-    rows = ti.xcom_pull(task_ids='transform_data')
+    - Отбрасывает строки где coin пустой или price_usd <= 0 / None
+    - Использует extracted_at из Airflow-контекста (retry-safe)
+    - ON CONFLICT DO NOTHING защищает от дублей по UNIQUE(coin, extracted_at)
+    """
+
+    ti = context.get('ti')
+    if ti is not None:
+        rows = ti.xcom_pull(task_ids='transform_data')
+        extracted_at = context.get('logical_date') or context.get('data_interval_start')
+
+    if extracted_at is None:
+        extracted_at = datetime.now(timezone.utc)
+
+    if not rows:
+        logger.warning("No rows received in load_silver, skipping")
+        return
+
+    valid_rows = []
+    rejected = 0
+    for row in rows:
+        coin = row.get("coin")
+        price = row.get("price")
+        if not coin or price is None or price <= 0:
+            rejected += 1
+            continue
+        valid_rows.append({
+            "coin": coin,
+            "price_usd": price,
+            "extracted_at": extracted_at,
+        })
+
+    logger.info(
+        f"Silver validation: {len(valid_rows)} valid, {rejected} rejected"
+    )
+
+    if not valid_rows:
+        logger.warning("No valid rows to load into silver")
+        return
 
     engine = create_engine(DB_URL)
 
-    logger.info(f"Loading {len(rows)} records to gold layer...")
+    with engine.begin() as conn:
+        query = text("""
+            INSERT INTO crypto_prices_silver (coin, price_usd, extracted_at)
+            VALUES (:coin, :price_usd, :extracted_at)
+            ON CONFLICT (coin, extracted_at) DO NOTHING
+        """)
+        conn.execute(query, valid_rows)
 
-    with engine.connect() as conn:
-        for row in rows:
-            query = text("""
-                INSERT INTO crypto_prices (coin, price_usd, loaded_at)
-                VALUES (:coin, :price, NOW())
-            """)
-            conn.execute(query, row)
-
-    logger.info(f"Loaded {len(rows)} records to crypto_prices")
+    logger.info(f"Loaded {len(valid_rows)} rows into crypto_prices_silver")
 
 
 def main() -> None:
-    """Основная функция для запуска без Airflow"""
+    """Запуск пайплайна без Airflow (для локальной отладки)"""
 
     wait_for_db()
 
@@ -127,7 +170,12 @@ def main() -> None:
 
     transformed = transform(raw_data=raw_data)
 
-    load_gold(rows=transformed)
+    extracted_at = datetime.now(timezone.utc)
+    load_silver(rows=transformed, extracted_at=extracted_at)
+
+    build_latest_prices()
+    build_daily_summary()
+    build_price_changes()
 
     calculate_metrics()
     pandas_analytics()
