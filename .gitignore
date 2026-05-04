@@ -138,10 +138,3 @@ airflow_postgres_data/
 
 # IDE
 .idea/
-
-# Local notes and AI-assistant context (не для публичной репы)
-.claude/
-CLAUDE.md
-
-# Personal files (резюме и т.п. — не коммитим персональные данные)
-*.pdf 
